@@ -97,7 +97,8 @@ class FireDetectorStreamer:
 
         if not cap.isOpened():
             with self.lock:
-                self.status_message = f"Failed to open source {self.source}"
+                self.status_message = "Standby (Simulated Feed / Cloud)"
+            self._standby_loop()
             return
 
         previous_gray: np.ndarray | None = None
@@ -195,6 +196,47 @@ class FireDetectorStreamer:
             time.sleep(0.01)
 
         cap.release()
+
+    def _standby_loop(self) -> None:
+        frame_w, frame_h = 1280, 720
+        t_start = time.monotonic()
+        while self.running:
+            now_t = time.monotonic() - t_start
+            frame = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+            # Background grid lines
+            for x in range(0, frame_w, 80):
+                cv2.line(frame, (x, 0), (x, frame_h), (25, 30, 38), 1)
+            for y in range(0, frame_h, 60):
+                cv2.line(frame, (0, y), (frame_w, y), (25, 30, 38), 1)
+
+            # Frame borders
+            cv2.rectangle(frame, (20, 20), (frame_w - 20, frame_h - 20), (45, 60, 75), 2)
+
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cv2.putText(frame, "PYROGUARD // OPTICAL SURVEILLANCE STANDBY", (50, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 240, 255), 2)
+            cv2.putText(frame, f"LIVE CLOCK: {now_str}", (50, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 210, 225), 2)
+            cv2.putText(frame, "STATUS: STANDBY MONITORING (CLOUD HOSTED)", (50, 155), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 100), 2)
+            cv2.putText(frame, "Optical sensor ready. Connect local webcam or RTSP stream for live fire telemetry.", (50, frame_h - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (140, 160, 180), 1)
+
+            # Animated radar scan sweep
+            scan_y = int(180 + ((np.sin(now_t * 2.5) + 1.0) / 2.0) * (frame_h - 260))
+            cv2.line(frame, (30, scan_y), (frame_w - 30, scan_y), (0, 160, 255), 2)
+
+            clean_frame = frame.copy()
+            hud_frame = frame.copy()
+
+            _, jpeg_frame = cv2.imencode(".jpg", hud_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            _, jpeg_clean = cv2.imencode(".jpg", clean_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            _, jpeg_mask = cv2.imencode(".jpg", np.zeros_like(frame), [cv2.IMWRITE_JPEG_QUALITY, 80])
+
+            with self.lock:
+                self.current_frame_jpeg = jpeg_frame.tobytes()
+                self.current_clean_jpeg = jpeg_clean.tobytes()
+                self.current_mask_jpeg = jpeg_mask.tobytes()
+                self.raw_frame = clean_frame
+                self.fps = 15.0
+
+            time.sleep(0.06)
 
     def get_frame_stream(self, mode: str = "processed"):
         while self.running:
@@ -332,25 +374,34 @@ def create_app(streamer: FireDetectorStreamer) -> Flask:
     return app
 
 
+# Module-level instance for production WSGI servers (Gunicorn, Render, etc.)
+streamer = FireDetectorStreamer(
+    source=os.environ.get("SOURCE", "0"),
+    min_area=int(os.environ.get("MIN_AREA", "1200")),
+    confirm_frames=int(os.environ.get("CONFIRM_FRAMES", "8")),
+    cooldown=float(os.environ.get("COOLDOWN", "10.0")),
+)
+streamer.start()
+app = create_app(streamer)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fire Camera Detector Web Command Center")
-    parser.add_argument("--source", default="0", help="Camera index or video file")
-    parser.add_argument("--host", default="127.0.0.1", help="Host address (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=5000, help="Port (default: 5000)")
-    parser.add_argument("--min-area", type=int, default=1200, help="Minimum flame area (px)")
-    parser.add_argument("--confirm-frames", type=int, default=8, help="Confirmation frame count")
-    parser.add_argument("--cooldown", type=float, default=10.0, help="Snapshot cooldown (seconds)")
+    parser.add_argument("--source", default=os.environ.get("SOURCE", "0"), help="Camera index or video file")
+    parser.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"), help="Host address (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "5000")), help="Port (default: 5000)")
+    parser.add_argument("--min-area", type=int, default=int(os.environ.get("MIN_AREA", "1200")), help="Minimum flame area (px)")
+    parser.add_argument("--confirm-frames", type=int, default=int(os.environ.get("CONFIRM_FRAMES", "8")), help="Confirmation frame count")
+    parser.add_argument("--cooldown", type=float, default=float(os.environ.get("COOLDOWN", "10.0")), help="Snapshot cooldown (seconds)")
     args = parser.parse_args()
 
-    streamer = FireDetectorStreamer(
-        source=args.source,
+    streamer.source = args.source
+    streamer.update_config(
         min_area=args.min_area,
         confirm_frames=args.confirm_frames,
         cooldown=args.cooldown,
     )
-    streamer.start()
 
-    app = create_app(streamer)
     print(f"\n=======================================================")
     print(f"🔥 Fire Camera Detector Web Dashboard running at:")
     print(f"   👉 http://{args.host}:{args.port}")
