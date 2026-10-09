@@ -577,6 +577,8 @@
             if (e.key === 'Escape' && !elements.snapshotModal.classList.contains('hidden')) {
                 closeModal();
             }
+        });
+
         if (elements.startWebcamCta) {
             elements.startWebcamCta.addEventListener('click', startDeviceWebcam);
         }
