@@ -16,6 +16,10 @@
     let previousAlertCount = 0;
     let configDebounceTimer = null;
     let currentModalFilename = '';
+    let isDeviceWebcamActive = false;
+    let webcamStream = null;
+    let webcamProcessing = false;
+    let webcamInterval = null;
 
     // DOM Elements
     const elements = {
@@ -28,6 +32,15 @@
         soundLabel: document.getElementById('soundLabel'),
         emergencyBanner: document.getElementById('emergencyBanner'),
         cameraStream: document.getElementById('cameraStream'),
+        localVideo: document.getElementById('localVideo'),
+        localCanvas: document.getElementById('localCanvas'),
+        cloudCameraPrompt: document.getElementById('cloudCameraPrompt'),
+        startWebcamCta: document.getElementById('startWebcamCta'),
+        webcamToggleBtn: document.getElementById('webcamToggleBtn'),
+        webcamIconStart: document.getElementById('webcamIconStart'),
+        webcamIconStop: document.getElementById('webcamIconStop'),
+        webcamBtnLabel: document.getElementById('webcamBtnLabel'),
+        streamLoading: document.getElementById('streamLoading'),
         fpsDisplay: document.getElementById('fpsDisplay'),
         modeProcessedBtn: document.getElementById('modeProcessedBtn'),
         modeCleanBtn: document.getElementById('modeCleanBtn'),
@@ -180,6 +193,15 @@
         elements.totalAlertsDisplay.textContent = data.total_alerts;
         elements.lastAlertDisplay.textContent = data.last_alert_timestamp || 'None Recorded';
 
+        // Cloud standby prompt banner
+        if (elements.cloudCameraPrompt) {
+            if (data.is_cloud_standby && !isDeviceWebcamActive) {
+                elements.cloudCameraPrompt.classList.remove('hidden');
+            } else {
+                elements.cloudCameraPrompt.classList.add('hidden');
+            }
+        }
+
         // Sound Siren Trigger
         if (data.is_alert) {
             initAudio();
@@ -195,6 +217,119 @@
             if (data.is_alert) {
                 showToast('🚨 New fire incident snapshot captured!');
             }
+        }
+    }
+
+    // =========================================================
+    // CLIENT DEVICE WEBCAM (HTML5 USERMEDIA)
+    // =========================================================
+    async function startDeviceWebcam() {
+        initAudio();
+        try {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                showToast('Webcam not supported or browser requires HTTPS.');
+                return;
+            }
+
+            elements.streamLoading.classList.remove('hidden');
+            showToast('Opening device camera...');
+
+            webcamStream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                    width: { ideal: 960 },
+                    height: { ideal: 540 },
+                    facingMode: 'user',
+                },
+                audio: false,
+            });
+
+            elements.localVideo.srcObject = webcamStream;
+            await elements.localVideo.play();
+
+            isDeviceWebcamActive = true;
+            if (elements.cloudCameraPrompt) {
+                elements.cloudCameraPrompt.classList.add('hidden');
+            }
+            elements.webcamToggleBtn.classList.add('active');
+            elements.webcamIconStart.classList.add('hidden');
+            elements.webcamIconStop.classList.remove('hidden');
+            elements.webcamBtnLabel.textContent = 'Stop Device Camera';
+            elements.streamTag.textContent = 'DEVICE WEBCAM // OPTICAL SENSOR';
+            elements.streamLoading.classList.add('hidden');
+            showToast('Device webcam active & analyzing for fire!');
+
+            const canvas = elements.localCanvas;
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+            clearInterval(webcamInterval);
+            webcamInterval = setInterval(async () => {
+                if (!isDeviceWebcamActive || webcamProcessing) return;
+                if (!elements.localVideo.videoWidth) return;
+
+                webcamProcessing = true;
+                try {
+                    const targetW = 640;
+                    const targetH = Math.round((elements.localVideo.videoHeight / elements.localVideo.videoWidth) * targetW) || 360;
+                    canvas.width = targetW;
+                    canvas.height = targetH;
+                    ctx.drawImage(elements.localVideo, 0, 0, targetW, targetH);
+
+                    const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+                    const res = await fetch('/api/process_frame', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            image: dataUrl,
+                            mode: currentMode,
+                        }),
+                    });
+
+                    if (res.ok) {
+                        const result = await res.json();
+                        if (result.image && isDeviceWebcamActive) {
+                            elements.cameraStream.src = result.image;
+                        }
+                        updateDashboard(result);
+                    }
+                } catch (err) {
+                    console.error('Frame processing error:', err);
+                } finally {
+                    webcamProcessing = false;
+                }
+            }, 85);
+
+        } catch (err) {
+            elements.streamLoading.classList.add('hidden');
+            console.error('Camera access error:', err);
+            showToast(`Camera permission error: ${err.message || 'Access denied'}`);
+        }
+    }
+
+    function stopDeviceWebcam() {
+        isDeviceWebcamActive = false;
+        clearInterval(webcamInterval);
+        if (webcamStream) {
+            webcamStream.getTracks().forEach((track) => track.stop());
+            webcamStream = null;
+        }
+        if (elements.localVideo) {
+            elements.localVideo.srcObject = null;
+        }
+        elements.webcamToggleBtn.classList.remove('active');
+        elements.webcamIconStart.classList.remove('hidden');
+        elements.webcamIconStop.classList.add('hidden');
+        elements.webcamBtnLabel.textContent = 'Activate My Webcam';
+        elements.streamTag.textContent = 'LIVE FEED // CAM-0';
+
+        reloadStream();
+        showToast('Switched back to optical server stream');
+    }
+
+    function toggleDeviceWebcam() {
+        if (isDeviceWebcamActive) {
+            stopDeviceWebcam();
+        } else {
+            startDeviceWebcam();
         }
     }
 
@@ -442,7 +577,12 @@
             if (e.key === 'Escape' && !elements.snapshotModal.classList.contains('hidden')) {
                 closeModal();
             }
-        });
+        if (elements.startWebcamCta) {
+            elements.startWebcamCta.addEventListener('click', startDeviceWebcam);
+        }
+        if (elements.webcamToggleBtn) {
+            elements.webcamToggleBtn.addEventListener('click', toggleDeviceWebcam);
+        }
 
         setupSliders();
         loadSnapshots();

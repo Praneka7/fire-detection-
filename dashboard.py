@@ -45,6 +45,9 @@ class FireDetectorStreamer:
         self.last_saved_time = 0.0
         self.last_alert_timestamp: str | None = None
         self.status_message = "Initializing..."
+        self.is_cloud_standby = False
+        self._client_previous_gray: np.ndarray | None = None
+        self._last_client_saved = 0.0
 
         # Frame buffers (JPEG bytes)
         self.current_frame_jpeg: bytes | None = None
@@ -198,6 +201,8 @@ class FireDetectorStreamer:
         cap.release()
 
     def _standby_loop(self) -> None:
+        with self.lock:
+            self.is_cloud_standby = True
         frame_w, frame_h = 1280, 720
         t_start = time.monotonic()
         while self.running:
@@ -216,7 +221,7 @@ class FireDetectorStreamer:
             cv2.putText(frame, "PYROGUARD // OPTICAL SURVEILLANCE STANDBY", (50, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 240, 255), 2)
             cv2.putText(frame, f"LIVE CLOCK: {now_str}", (50, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 210, 225), 2)
             cv2.putText(frame, "STATUS: STANDBY MONITORING (CLOUD HOSTED)", (50, 155), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 100), 2)
-            cv2.putText(frame, "Optical sensor ready. Connect local webcam or RTSP stream for live fire telemetry.", (50, frame_h - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (140, 160, 180), 1)
+            cv2.putText(frame, "Optical sensor ready. Click 'Activate Device Camera' to stream local webcam.", (50, frame_h - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (140, 160, 180), 1)
 
             # Animated radar scan sweep
             scan_y = int(180 + ((np.sin(now_t * 2.5) + 1.0) / 2.0) * (frame_h - 260))
@@ -237,6 +242,81 @@ class FireDetectorStreamer:
                 self.fps = 15.0
 
             time.sleep(0.06)
+
+    def process_external_frame(self, frame: np.ndarray, mode: str = "processed") -> dict:
+        """Process a webcam frame sent directly from the browser client."""
+        with self.lock:
+            current_min_area = self.min_area
+            current_confirm = self.confirm_frames
+            current_cooldown = self.cooldown
+
+        client_prev = getattr(self, "_client_previous_gray", None)
+        mask, self._client_previous_gray = flame_mask(frame, client_prev)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        valid_regions = []
+        total_area = 0
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area >= current_min_area:
+                valid_regions.append((cv2.boundingRect(c), int(area)))
+                total_area += int(area)
+
+        # Update candidate frames
+        with self.lock:
+            if valid_regions:
+                self.candidate_frames += 1
+            else:
+                self.candidate_frames = 0
+            candidate_frames = self.candidate_frames
+            alerted = candidate_frames >= current_confirm
+            self.is_alert = alerted
+            self.regions_count = len(valid_regions)
+            self.total_flame_area = total_area
+            self.raw_frame = frame
+
+        now = time.monotonic()
+        saved_new_alert = False
+        last_saved = getattr(self, "_last_client_saved", 0.0)
+        if alerted and (now - last_saved >= current_cooldown):
+            filename = self.output_dir / f"fire_alert_{datetime.now():%Y%m%d_%H%M%S}.jpg"
+            cv2.imwrite(str(filename), frame)
+            self._last_client_saved = now
+            saved_new_alert = True
+            with self.lock:
+                self.total_alerts += 1
+                self.last_alert_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if mode == "mask":
+            mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            display_frame = np.zeros_like(mask_bgr)
+            display_frame[:, :, 2] = mask
+            display_frame[:, :, 1] = (mask * 0.5).astype(np.uint8)
+        elif mode == "clean":
+            display_frame = frame
+        else:
+            display_frame = frame.copy()
+            for (x, y, w, h), area in valid_regions:
+                cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                tag = f"FLAME {area}px"
+                cv2.putText(display_frame, tag, (x, max(y - 8, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+
+        _, jpeg_bytes = cv2.imencode(".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        import base64
+        b64_str = "data:image/jpeg;base64," + base64.b64encode(jpeg_bytes.tobytes()).decode("ascii")
+
+        confirm_percent = min(100, int((candidate_frames / max(1, current_confirm)) * 100))
+        return {
+            "image": b64_str,
+            "is_alert": alerted,
+            "candidate_frames": candidate_frames,
+            "confirm_frames": current_confirm,
+            "confirm_percent": confirm_percent,
+            "regions_count": len(valid_regions),
+            "total_flame_area": total_area,
+            "saved_snapshot": saved_new_alert,
+            "total_alerts": self.total_alerts,
+        }
 
     def get_frame_stream(self, mode: str = "processed"):
         while self.running:
@@ -283,6 +363,7 @@ class FireDetectorStreamer:
                 "total_alerts": self.total_alerts,
                 "last_alert_timestamp": self.last_alert_timestamp,
                 "status_message": self.status_message,
+                "is_cloud_standby": self.is_cloud_standby,
                 "server_time": datetime.now().strftime("%H:%M:%S"),
             }
 
@@ -370,6 +451,28 @@ def create_app(streamer: FireDetectorStreamer) -> Flask:
         if name:
             return jsonify({"success": True, "filename": name})
         return jsonify({"success": False, "error": "No frame available"}), 400
+
+    @app.route("/api/process_frame", methods=["POST"])
+    def process_frame():
+        import base64
+        data = request.get_json(force=True, silent=True) or {}
+        b64_data = data.get("image", "")
+        if "," in b64_data:
+            b64_data = b64_data.split(",", 1)[1]
+        if not b64_data:
+            return jsonify({"error": "No image data"}), 400
+        try:
+            img_bytes = base64.b64decode(b64_data)
+            nparr = np.frombuffer(img_bytes, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if frame is None:
+                return jsonify({"error": "Decode failed"}), 400
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+
+        mode = data.get("mode", "processed")
+        result = streamer.process_external_frame(frame, mode=mode)
+        return jsonify(result)
 
     return app
 
