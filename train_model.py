@@ -33,9 +33,15 @@ def make_splits(targets: list[int], seed: int) -> tuple[list[int], list[int], li
     return train, validation, test
 
 
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> tuple[float, float]:
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    fire_index: int,
+    threshold: float,
+) -> dict:
     model.eval()
-    correct = total = 0
+    true_positive = true_negative = false_positive = false_negative = 0
     loss_sum = 0.0
     criterion = nn.CrossEntropyLoss()
     with torch.no_grad():
@@ -43,9 +49,34 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> tupl
             images, labels = images.to(device), labels.to(device)
             logits = model(images)
             loss_sum += criterion(logits, labels).item() * labels.size(0)
-            correct += (logits.argmax(dim=1) == labels).sum().item()
-            total += labels.size(0)
-    return loss_sum / max(total, 1), correct / max(total, 1)
+            fire_probability = torch.softmax(logits, dim=1)[:, fire_index]
+            predicted_fire = fire_probability >= threshold
+            actual_fire = labels == fire_index
+            true_positive += int((predicted_fire & actual_fire).sum().item())
+            true_negative += int((~predicted_fire & ~actual_fire).sum().item())
+            false_positive += int((predicted_fire & ~actual_fire).sum().item())
+            false_negative += int((~predicted_fire & actual_fire).sum().item())
+
+    total = true_positive + true_negative + false_positive + false_negative
+    precision = true_positive / max(true_positive + false_positive, 1)
+    recall = true_positive / max(true_positive + false_negative, 1)
+    specificity = true_negative / max(true_negative + false_positive, 1)
+    return {
+        "loss": loss_sum / max(total, 1),
+        "accuracy": (true_positive + true_negative) / max(total, 1),
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "f1": 2 * precision * recall / max(precision + recall, 1e-12),
+        "threshold": threshold,
+        "confusion_matrix": {
+            "true_negative": true_negative,
+            "false_positive": false_positive,
+            "false_negative": false_negative,
+            "true_positive": true_positive,
+        },
+        "samples": total,
+    }
 
 
 def main() -> None:
@@ -56,7 +87,11 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-pretrained", action="store_true", help="Do not use ImageNet initialization.")
+    parser.add_argument("--test-dir", type=Path, help="Optional independent ImageFolder test set, with the same two class folders.")
+    parser.add_argument("--threshold", type=float, default=0.90, help="Fire probability threshold used in test metrics (0.50-0.999).")
     args = parser.parse_args()
+    if not 0.50 <= args.threshold <= 0.999:
+        raise SystemExit("--threshold must be between 0.50 and 0.999.")
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -76,6 +111,8 @@ def main() -> None:
     source = datasets.ImageFolder(args.data_dir)
     if len(source.classes) != 2:
         raise SystemExit(f"Expected exactly two folders/classes, found: {source.classes}")
+    if "fire_images" not in source.class_to_idx or "non_fire_images" not in source.class_to_idx:
+        raise SystemExit("Class folders must be named fire_images and non_fire_images.")
     train_ids, val_ids, test_ids = make_splits(source.targets, args.seed)
     train_dataset = Subset(datasets.ImageFolder(args.data_dir, augment), train_ids)
     eval_dataset = datasets.ImageFolder(args.data_dir, normalise)
@@ -85,6 +122,11 @@ def main() -> None:
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, num_workers=0)
     val_loader = DataLoader(Subset(eval_dataset, val_ids), batch_size=args.batch_size, shuffle=False, num_workers=0)
     test_loader = DataLoader(Subset(eval_dataset, test_ids), batch_size=args.batch_size, shuffle=False, num_workers=0)
+    if args.test_dir:
+        independent_test = datasets.ImageFolder(args.test_dir, normalise)
+        if independent_test.class_to_idx != source.class_to_idx:
+            raise SystemExit(f"Independent test classes must match training classes: {source.class_to_idx}")
+        test_loader = DataLoader(independent_test, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     weights = None if args.no_pretrained else models.EfficientNet_B0_Weights.DEFAULT
     model = models.efficientnet_b0(weights=weights)
@@ -105,18 +147,32 @@ def main() -> None:
             loss = criterion(model(images), labels)
             loss.backward()
             optimizer.step()
-        val_loss, val_accuracy = evaluate(model, val_loader, device)
-        print(f"Epoch {epoch}/{args.epochs}: validation loss={val_loss:.4f}, accuracy={val_accuracy:.2%}")
-        if val_accuracy > best_accuracy:
-            best_accuracy = val_accuracy
-            torch.save({"model_state": model.state_dict(), "class_to_idx": source.class_to_idx}, model_path)
+        val_metrics = evaluate(model, val_loader, device, source.class_to_idx["fire_images"], args.threshold)
+        print(
+            f"Epoch {epoch}/{args.epochs}: validation loss={val_metrics['loss']:.4f}, "
+            f"accuracy={val_metrics['accuracy']:.2%}, precision={val_metrics['precision']:.2%}, "
+            f"recall={val_metrics['recall']:.2%}"
+        )
+        if val_metrics["accuracy"] > best_accuracy:
+            best_accuracy = val_metrics["accuracy"]
+            torch.save({
+                "architecture": "efficientnet_b0",
+                "image_size": IMAGE_SIZE,
+                "model_state": model.state_dict(),
+                "class_to_idx": source.class_to_idx,
+            }, model_path)
 
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state"])
-    test_loss, test_accuracy = evaluate(model, test_loader, device)
-    metrics = {"test_loss": test_loss, "test_accuracy": test_accuracy, "best_validation_accuracy": best_accuracy}
+    test_metrics = evaluate(model, test_loader, device, source.class_to_idx["fire_images"], args.threshold)
+    metrics = {
+        "test": test_metrics,
+        "best_validation_accuracy": best_accuracy,
+        "test_set": "independent" if args.test_dir else "stratified_holdout_from_training_directory",
+        "threshold_note": "Metrics use the configured fire-probability threshold. Test scenes must be disjoint from training scenes for an unbiased estimate.",
+    }
     (model_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    print(f"Saved {model_path}. Test accuracy: {test_accuracy:.2%}")
+    print(f"Saved {model_path}. Test metrics: {json.dumps(test_metrics, sort_keys=True)}")
 
 
 if __name__ == "__main__":

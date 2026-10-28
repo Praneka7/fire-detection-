@@ -56,6 +56,8 @@
         confirmProgressBar: document.getElementById('confirmProgressBar'),
         regionsCountDisplay: document.getElementById('regionsCountDisplay'),
         flameAreaDisplay: document.getElementById('flameAreaDisplay'),
+        confidenceSlider: document.getElementById('confidenceSlider'),
+        confidenceBadge: document.getElementById('confidenceBadge'),
         totalAlertsDisplay: document.getElementById('totalAlertsDisplay'),
         lastAlertDisplay: document.getElementById('lastAlertDisplay'),
         minAreaSlider: document.getElementById('minAreaSlider'),
@@ -173,14 +175,31 @@
         }
 
         // System pill & FPS
-        elements.systemStatusText.textContent = data.is_alert ? 'FIRE ALARM ACTIVE' : 'SYSTEM ONLINE';
+        if (data.is_alert) {
+            elements.systemStatusText.textContent = 'FIRE ALARM ACTIVE';
+        } else if (data.fallback_active) {
+            elements.systemStatusText.textContent = 'OPTICAL SURVEILLANCE';
+        } else if (data.model_ready === false) {
+            elements.systemStatusText.textContent = 'FIRE MODEL UNAVAILABLE';
+        } else {
+            elements.systemStatusText.textContent = 'SYSTEM ONLINE';
+        }
         elements.systemPill.classList.toggle('alert-active', data.is_alert);
         elements.fpsDisplay.textContent = (data.fps || 0).toFixed(1);
 
         // Alert state visual cues
         elements.emergencyBanner.classList.toggle('hidden', !data.is_alert);
         elements.alertStatusCard.classList.toggle('state-alert', data.is_alert);
-        elements.mainStatusText.textContent = data.is_alert ? '🔥 FIRE ALERT DETECTED' : 'MONITORING SECURE';
+        elements.alertStatusCard.classList.toggle('state-model-unavailable', data.model_ready === false && !data.fallback_active && !data.is_alert);
+        if (data.is_alert) {
+            elements.mainStatusText.textContent = '🔥 FIRE ALERT DETECTED';
+        } else if (data.fallback_active) {
+            elements.mainStatusText.textContent = 'OPTICAL MONITORING (COLOR & MOTION)';
+        } else if (data.model_ready === false) {
+            elements.mainStatusText.textContent = 'AI MODEL REQUIRED — ALERTS MUTED';
+        } else {
+            elements.mainStatusText.textContent = 'MONITORING SECURE';
+        }
 
         // Confirmation progress meter
         const countText = `${data.candidate_frames} / ${data.confirm_frames} FRAMES`;
@@ -352,11 +371,18 @@
             queueConfigUpdate();
         });
 
+        elements.confidenceSlider.addEventListener('input', (e) => {
+            elements.confidenceBadge.textContent = `${e.target.value}%`;
+            queueConfigUpdate();
+        });
+
         elements.resetDefaultsBtn.addEventListener('click', () => {
             elements.minAreaSlider.value = 1200;
             elements.minAreaBadge.textContent = '1200 px';
-            elements.confirmFramesSlider.value = 8;
-            elements.confirmFramesBadge.textContent = '8 frames';
+            elements.confidenceSlider.value = 90;
+            elements.confidenceBadge.textContent = '90%';
+            elements.confirmFramesSlider.value = 15;
+            elements.confirmFramesBadge.textContent = '15 frames';
             elements.cooldownSlider.value = 10;
             elements.cooldownBadge.textContent = '10 s';
             queueConfigUpdate();
@@ -373,6 +399,7 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         min_area: parseInt(elements.minAreaSlider.value, 10),
+                        confidence_threshold: parseInt(elements.confidenceSlider.value, 10) / 100,
                         confirm_frames: parseInt(elements.confirmFramesSlider.value, 10),
                         cooldown: parseFloat(elements.cooldownSlider.value),
                     }),

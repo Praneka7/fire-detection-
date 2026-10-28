@@ -216,7 +216,7 @@
                 <div class="meter-wrapper">
                     <div class="meter-labels">
                         <span class="meter-title">FIRE CONFIRMATION BUFFER</span>
-                        <span class="meter-val" id="bufferCountDisplay">0 / 8 FRAMES</span>
+                        <span class="meter-val" id="bufferCountDisplay">0 / 15 FRAMES</span>
                     </div>
                     <div class="progress-bar-bg">
                         <div class="progress-bar-fill" id="confirmProgressBar" style="width: 0%;"></div>
@@ -310,13 +310,22 @@
                         <span class="input-hint">Higher values filter out tiny flickers and reflections.</span>
                     </div>
 
+                    <div class="control-group">
+                        <div class="control-label-row">
+                            <label for="confidenceSlider">AI Fire Confidence</label>
+                            <span class="slider-badge" id="confidenceBadge">90%</span>
+                        </div>
+                        <input type="range" id="confidenceSlider" min="50" max="99" step="1" value="90">
+                        <span class="input-hint">Only AI-verified candidate regions at or above this confidence can start alert confirmation.</span>
+                    </div>
+
                     <!-- Confirm Frames Slider -->
                     <div class="control-group">
                         <div class="control-label-row">
                             <label for="confirmFramesSlider">Consecutive Confirmation Frames</label>
-                            <span class="slider-badge" id="confirmFramesBadge">8 frames</span>
+                            <span class="slider-badge" id="confirmFramesBadge">15 frames</span>
                         </div>
-                        <input type="range" id="confirmFramesSlider" min="2" max="25" step="1" value="8">
+                        <input type="range" id="confirmFramesSlider" min="2" max="30" step="1" value="15">
                         <span class="input-hint">Frames required before alert triggers (prevents momentary flashes).</span>
                     </div>
 

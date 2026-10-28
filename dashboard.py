@@ -18,15 +18,23 @@ import cv2
 import numpy as np
 from flask import Flask, Response, jsonify, render_template, request, send_from_directory
 
-from fire_detector import flame_mask, parse_source
+from fire_detector import ConsecutiveFireConfirmation, detect_verified_fire, parse_source
+from fire_model import FireModel
 
 
 class FireDetectorStreamer:
-    def __init__(self, source: int | str = 0, min_area: int = 1200, confirm_frames: int = 8, cooldown: float = 10.0):
+    def __init__(self, source: int | str = 0, min_area: int = 1200, confirm_frames: int = 15,
+                 cooldown: float = 10.0, confidence_threshold: float = 0.90,
+                 allow_fallback: bool = True):
         self.source = source
         self.min_area = min_area
         self.confirm_frames = confirm_frames
         self.cooldown = cooldown
+        self.confidence_threshold = max(0.50, min(0.999, float(confidence_threshold)))
+        self.allow_fallback = allow_fallback
+        self.confirmation = ConsecutiveFireConfirmation(self.confirm_frames)
+        model_path = Path(os.environ.get("FIRE_MODEL_PATH", Path(__file__).parent / "models" / "fire_classifier.pt"))
+        self.fire_model = FireModel(model_path, self.confidence_threshold)
 
         self.output_dir = Path(__file__).parent / "detections"
         self.output_dir.mkdir(exist_ok=True)
@@ -123,24 +131,15 @@ class FireDetectorStreamer:
                 current_confirm = self.confirm_frames
                 current_cooldown = self.cooldown
 
-            # Compute flame mask and contours
-            mask, previous_gray = flame_mask(frame, previous_gray)
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            mask, previous_gray, valid_regions, _ = detect_verified_fire(
+                frame, previous_gray, self.fire_model, current_min_area, self.confidence_threshold,
+                allow_heuristic_fallback=self.allow_fallback,
+            )
+            total_area = sum(area for _, area, _ in valid_regions)
 
-            valid_regions = []
-            total_area = 0
-            for c in contours:
-                area = cv2.contourArea(c)
-                if area >= current_min_area:
-                    valid_regions.append((cv2.boundingRect(c), int(area)))
-                    total_area += int(area)
-
-            # Update alert state
-            if valid_regions:
-                candidate_frames = self.candidate_frames + 1
-            else:
-                candidate_frames = 0
-            alerted = candidate_frames >= current_confirm
+            # Only verified fire can advance the shared consecutive-frame buffer.
+            with self.lock:
+                candidate_frames, alerted = self.confirmation.update(bool(valid_regions), current_confirm)
 
             now = time.monotonic()
             saved_new_alert = False
@@ -165,9 +164,9 @@ class FireDetectorStreamer:
 
             # Draw HUD overlay
             hud_frame = frame.copy()
-            for (x, y, w, h), area in valid_regions:
+            for (x, y, w, h), area, confidence in valid_regions:
                 cv2.rectangle(hud_frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                tag = f"FLAME {area}px"
+                tag = f"FIRE {confidence:.0%} | {area}px" if self.fire_model.available else f"FLAME {area}px"
                 cv2.putText(hud_frame, tag, (x, max(y - 8, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 
             # Mask representation in 3 channels (colored amber for display)
@@ -251,25 +250,16 @@ class FireDetectorStreamer:
             current_cooldown = self.cooldown
 
         client_prev = getattr(self, "_client_previous_gray", None)
-        mask, self._client_previous_gray = flame_mask(frame, client_prev)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mask, self._client_previous_gray, valid_regions, candidate_count = detect_verified_fire(
+            frame, client_prev, self.fire_model, current_min_area, self.confidence_threshold,
+            allow_heuristic_fallback=self.allow_fallback,
+        )
+        total_area = sum(area for _, area, _ in valid_regions)
 
-        valid_regions = []
-        total_area = 0
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area >= current_min_area:
-                valid_regions.append((cv2.boundingRect(c), int(area)))
-                total_area += int(area)
-
-        # Update candidate frames
+        # Update the same consecutive confirmation buffer used by native camera frames.
         with self.lock:
-            if valid_regions:
-                self.candidate_frames += 1
-            else:
-                self.candidate_frames = 0
-            candidate_frames = self.candidate_frames
-            alerted = candidate_frames >= current_confirm
+            candidate_frames, alerted = self.confirmation.update(bool(valid_regions), current_confirm)
+            self.candidate_frames = candidate_frames
             self.is_alert = alerted
             self.regions_count = len(valid_regions)
             self.total_flame_area = total_area
@@ -296,9 +286,9 @@ class FireDetectorStreamer:
             display_frame = frame
         else:
             display_frame = frame.copy()
-            for (x, y, w, h), area in valid_regions:
+            for (x, y, w, h), area, confidence in valid_regions:
                 cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                tag = f"FLAME {area}px"
+                tag = f"FIRE {confidence:.0%} | {area}px" if self.fire_model.available else f"FLAME {area}px"
                 cv2.putText(display_frame, tag, (x, max(y - 8, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 
         _, jpeg_bytes = cv2.imencode(".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -314,8 +304,13 @@ class FireDetectorStreamer:
             "confirm_percent": confirm_percent,
             "regions_count": len(valid_regions),
             "total_flame_area": total_area,
+            "fire_confidence": max((score for _, _, score in valid_regions), default=(1.0 if (valid_regions and not self.fire_model.available) else 0.0)),
+            "model_ready": self.fire_model.available,
+            "fallback_active": (not self.fire_model.available) and self.allow_fallback,
+            "model_error": self.fire_model.error,
             "saved_snapshot": saved_new_alert,
             "total_alerts": self.total_alerts,
+            "confidence_threshold": self.confidence_threshold,
         }
 
     def get_frame_stream(self, mode: str = "processed"):
@@ -358,6 +353,10 @@ class FireDetectorStreamer:
                 "regions_count": self.regions_count,
                 "total_flame_area": self.total_flame_area,
                 "min_area": self.min_area,
+                "confidence_threshold": self.confidence_threshold,
+                "model_ready": self.fire_model.available,
+                "fallback_active": (not self.fire_model.available) and self.allow_fallback,
+                "model_error": self.fire_model.error,
                 "cooldown": self.cooldown,
                 "fps": self.fps,
                 "total_alerts": self.total_alerts,
@@ -367,7 +366,8 @@ class FireDetectorStreamer:
                 "server_time": datetime.now().strftime("%H:%M:%S"),
             }
 
-    def update_config(self, min_area: int | None = None, confirm_frames: int | None = None, cooldown: float | None = None) -> None:
+    def update_config(self, min_area: int | None = None, confirm_frames: int | None = None,
+                      cooldown: float | None = None, confidence_threshold: float | None = None) -> None:
         with self.lock:
             if min_area is not None:
                 self.min_area = max(100, int(min_area))
@@ -375,6 +375,9 @@ class FireDetectorStreamer:
                 self.confirm_frames = max(1, int(confirm_frames))
             if cooldown is not None:
                 self.cooldown = max(1.0, float(cooldown))
+            if confidence_threshold is not None:
+                self.confidence_threshold = max(0.50, min(0.999, float(confidence_threshold)))
+                self.fire_model.threshold = self.confidence_threshold
 
     def get_snapshots(self) -> list[dict]:
         files = sorted(self.output_dir.glob("*.jpg"), key=os.path.getmtime, reverse=True)
@@ -421,6 +424,7 @@ def create_app(streamer: FireDetectorStreamer) -> Flask:
             min_area=data.get("min_area"),
             confirm_frames=data.get("confirm_frames"),
             cooldown=data.get("cooldown"),
+            confidence_threshold=data.get("confidence_threshold"),
         )
         return jsonify({"success": True, "config": streamer.get_status()})
 
@@ -481,8 +485,9 @@ def create_app(streamer: FireDetectorStreamer) -> Flask:
 streamer = FireDetectorStreamer(
     source=os.environ.get("SOURCE", "0"),
     min_area=int(os.environ.get("MIN_AREA", "1200")),
-    confirm_frames=int(os.environ.get("CONFIRM_FRAMES", "8")),
+    confirm_frames=int(os.environ.get("CONFIRM_FRAMES", "15")),
     cooldown=float(os.environ.get("COOLDOWN", "10.0")),
+    confidence_threshold=float(os.environ.get("FIRE_CONFIDENCE", "0.90")),
 )
 streamer.start()
 app = create_app(streamer)
@@ -494,20 +499,24 @@ def main():
     parser.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"), help="Host address (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "5000")), help="Port (default: 5000)")
     parser.add_argument("--min-area", type=int, default=int(os.environ.get("MIN_AREA", "1200")), help="Minimum flame area (px)")
-    parser.add_argument("--confirm-frames", type=int, default=int(os.environ.get("CONFIRM_FRAMES", "8")), help="Confirmation frame count")
+    parser.add_argument("--confirm-frames", type=int, default=int(os.environ.get("CONFIRM_FRAMES", "15")), help="Confirmation frame count")
     parser.add_argument("--cooldown", type=float, default=float(os.environ.get("COOLDOWN", "10.0")), help="Snapshot cooldown (seconds)")
+    parser.add_argument("--confidence", type=float, default=float(os.environ.get("FIRE_CONFIDENCE", "0.90")), help="Minimum fire-model confidence (0.50-0.999)")
+    parser.add_argument("--strict-ai", action="store_true", help="Strictly mute alerts if AI model weights are missing")
     args = parser.parse_args()
 
     streamer.source = args.source
+    streamer.allow_fallback = not args.strict_ai
     streamer.update_config(
         min_area=args.min_area,
         confirm_frames=args.confirm_frames,
         cooldown=args.cooldown,
+        confidence_threshold=args.confidence,
     )
 
     print(f"\n=======================================================")
-    print(f"🔥 Fire Camera Detector Web Dashboard running at:")
-    print(f"   👉 http://{args.host}:{args.port}")
+    print(f"[*] Fire Camera Detector Web Dashboard running at:")
+    print(f"    -> http://{args.host}:{args.port}")
     print(f"=======================================================\n")
 
     try:

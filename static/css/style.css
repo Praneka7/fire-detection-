@@ -722,6 +722,11 @@ body {
     box-shadow: 0 0 30px rgba(239, 68, 68, 0.25);
 }
 
+.alert-status-card.state-model-unavailable {
+    border-color: rgba(245, 158, 11, 0.65);
+    background: linear-gradient(180deg, rgba(245, 158, 11, 0.12) 0%, var(--bg-glass) 100%);
+}
+
 .status-badge {
     display: flex;
     align-items: center;
@@ -744,6 +749,11 @@ body {
     background: rgba(239, 68, 68, 0.2);
     color: var(--accent-crimson);
     animation: pulse 1s infinite;
+}
+
+.state-model-unavailable .badge-icon {
+    background: rgba(245, 158, 11, 0.2);
+    color: #f59e0b;
 }
 
 .badge-icon svg {

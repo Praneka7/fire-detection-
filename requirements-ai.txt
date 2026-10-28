@@ -1,4 +1,4 @@
-# Optional dependencies for Kaggle dataset download and PyTorch neural network training
+# Optional dependencies for AI inference/training and Kaggle dataset download
 torch>=2.2.0
 torchvision>=0.17.0
 kagglehub>=0.3.0
