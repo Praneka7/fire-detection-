@@ -61,7 +61,14 @@ def play_alert() -> None:
         print("\a", end="", flush=True)
 
 
-FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+FACE_CASCADE = None
+if hasattr(cv2, "CascadeClassifier") and hasattr(cv2, "data") and hasattr(cv2.data, "haarcascades"):
+    try:
+        _cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        if not _cascade.empty():
+            FACE_CASCADE = _cascade
+    except Exception:
+        FACE_CASCADE = None
 
 
 def flame_mask(frame: np.ndarray, previous_gray: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
@@ -88,7 +95,7 @@ def flame_mask(frame: np.ndarray, previous_gray: np.ndarray | None) -> tuple[np.
 
     # Human face & head suppression: zero out detected face regions
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    if not FACE_CASCADE.empty():
+    if FACE_CASCADE is not None:
         faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=3, minSize=(50, 50))
         for (fx, fy, fw, fh) in faces:
             pad_w = int(fw * 0.30)
